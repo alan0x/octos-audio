@@ -81,7 +81,8 @@ SFU or an Agora project. Configure `deploy/.env.example` and
 ## Checks
 
 ```bash
-make check   # cargo test + clippy, python unittest, JS/shell syntax checks
+make check   # cargo test + clippy, Python/JS tests, JS/shell syntax checks
+make integration-check  # local Ping/Pong, silent disconnect and startup timeout regressions
 ```
 
 Requires Rust 1.96+, Python 3.10+, Node.js.

@@ -65,6 +65,13 @@ const SPEECH_START_SAMPLES = 2;
 const METER_INTERVAL_MS = 100;
 
 const runtime = {
+  bridgeOnline: null,
+  statusRequest: 0,
+  starting: false,
+  bridgeReady: false,
+  rtcReady: false,
+  startupTimer: null,
+  startAttempt: 0,
   session: null,
   socket: null,
   rtcClient: null,
@@ -249,10 +256,10 @@ function setSessionState(label) {
 }
 
 function setRunning(running) {
-  ui.start.disabled = running;
+  ui.start.disabled = running || runtime.starting || runtime.bridgeOnline !== true;
   ui.mute.disabled = !running;
   ui.commit.disabled = !running;
-  ui.stop.disabled = !running;
+  ui.stop.disabled = !running && !runtime.starting;
   ui.ttsText.disabled = !running;
   ui.ttsVoiceSelect.disabled = !running;
   ui.ttsSpeed.disabled = !running;
@@ -349,7 +356,10 @@ async function api(path, options = {}) {
   if (runtime.accessToken) {
     headers.Authorization = `Bearer ${runtime.accessToken}`;
   }
-  const response = await fetch(path, { credentials: "same-origin", credentials_mode: "include", ...options, headers });
+  const response = await fetch(path, {
+    credentials: "same-origin", cache: "no-store", signal: AbortSignal.timeout(15000),
+    ...options, headers,
+  });
   if (response.status === 204) return null;
   const contentType = response.headers.get("content-type") || "";
   const payload = contentType.includes("application/json")
@@ -363,10 +373,13 @@ async function api(path, options = {}) {
 }
 
 async function refreshStatus() {
+  const request = ++runtime.statusRequest;
   try {
-    const status = await api("/api/v1/status");
+    const status = await api("/api/v1/status", { signal: AbortSignal.timeout(5000) });
+    if (runtime.statusRequest !== request) return;
     runtime.accessProtected = Boolean(status.accessProtected);
     const bridgeOk = Boolean(status.bridgeOnline);
+    runtime.bridgeOnline = bridgeOk;
 
     if (ui.navBridgeDot && ui.navBridgeLabel) {
       setDot(ui.navBridgeDot, bridgeOk ? "on" : "error");
@@ -374,7 +387,7 @@ async function refreshStatus() {
     }
 
     if (ui.bridgeState) {
-      ui.bridgeState.textContent = bridgeOk ? "在线 (就绪)" : "离线";
+      ui.bridgeState.textContent = bridgeOk ? "在线 (连接正常)" : "离线";
       ui.bridgeState.style.color = bridgeOk ? "#34d399" : "#f87171";
     }
 
@@ -382,11 +395,18 @@ async function refreshStatus() {
     if (ui.modeBadge) {
       ui.modeBadge.textContent = status.demoMode ? "MOCK 演示模式" : "RTC 真实推流";
     }
+    setRunning(Boolean(runtime.session && !runtime.starting && runtime.bridgeReady && runtime.rtcReady));
+    if (!bridgeOk && runtime.session) {
+      failSession("Bridge 已离线，请等待连接恢复后重试。");
+    }
   } catch (error) {
+    if (runtime.statusRequest !== request) return;
+    runtime.bridgeOnline = null;
     if (ui.navBridgeLabel) ui.navBridgeLabel.textContent = "控制面异常";
     if (ui.bridgeState) ui.bridgeState.textContent = "无法连接";
     setDot(ui.navBridgeDot, "error");
     setDot(ui.bridgeDot, "error");
+    setRunning(Boolean(runtime.session && !runtime.starting && runtime.bridgeReady && runtime.rtcReady));
   }
 }
 
@@ -400,11 +420,13 @@ function openEventSocket(wsPath) {
   runtime.socket = socket;
 
   socket.addEventListener("open", () => {
+    if (runtime.socket !== socket) return;
     log("已连接控制面 WebSocket 事件流");
     setDot(ui.browserDot, "on");
   });
 
   socket.addEventListener("message", (event) => {
+    if (runtime.socket !== socket) return;
     try {
       const payload = JSON.parse(event.data);
       handleServerEvent(payload);
@@ -414,17 +436,30 @@ function openEventSocket(wsPath) {
   });
 
   socket.addEventListener("close", (e) => {
+    if (runtime.socket !== socket) return;
     log("WebSocket 断开", { code: e.code });
     setDot(ui.browserDot, "");
-    if (runtime.session) cleanupLocal();
+    if (runtime.session) failSession("控制面事件连接已断开，请重新开始会话。");
   });
 
   socket.addEventListener("error", () => {
+    if (runtime.socket !== socket) return;
     setDot(ui.browserDot, "error");
   });
 }
 
 function handleServerEvent(event) {
+  if (!runtime.session || event.sessionId !== runtime.session.sessionId) return;
+  if (event.type === "session.snapshot") {
+    if (event.bridgeOnline === false) {
+      failSession("Bridge 已离线，请稍后重试。");
+    } else if (event.state === "ready") {
+      markReady();
+    } else if (event.state === "error" || event.state === "closed") {
+      failSession("会话启动失败或已结束，请重新开始。");
+    }
+    return;
+  }
   if (event.type === "session.ready") {
     markReady();
     log("会话已就绪");
@@ -452,6 +487,10 @@ function handleServerEvent(event) {
   }
 
   if (event.type === "asr.error") {
+    if (runtime.starting || event.code === "bridge_offline" || event.code === "session_start_timeout") {
+      failSession(event.message || "会话启动失败，请稍后重试。");
+      return;
+    }
     setDot(ui.asrDot, "error");
     appendFinal(`⚠ 识别错误: ${event.message || "未知异常"}`);
     log("识别异常", event);
@@ -488,20 +527,42 @@ function handleServerEvent(event) {
 
   if (event.type === "session.closed") {
     log("收到 session.closed 事件");
-    cleanupLocal();
+    if (runtime.starting) failSession("会话在就绪前已结束，请稍后重试。");
+    else cleanupLocal("会话已结束");
     return;
   }
 
   if (event.type === "session.expired") {
     appendFinal("⚠ 会话已到期，请重新开始识别。");
-    cleanupLocal();
+    cleanupLocal("会话已到期");
   }
 }
 
 function markReady() {
+  runtime.bridgeReady = true;
+  if (!runtime.rtcReady) return;
+  clearTimeout(runtime.startupTimer);
+  runtime.startupTimer = null;
+  runtime.starting = false;
   setSessionState("识别中");
-  setDot(ui.bridgeDot, "on");
   setDot(ui.asrDot, "on");
+  setRunning(true);
+}
+
+function failSession(message) {
+  const label = runtime.starting ? "启动失败" : "连接已中断";
+  appendFinal(`⚠ ${message}`);
+  log(message);
+  void stop(label);
+}
+
+function armStartupTimeout(milliseconds, attempt) {
+  clearTimeout(runtime.startupTimer);
+  runtime.startupTimer = setTimeout(() => {
+    if (runtime.startAttempt === attempt && runtime.starting) {
+      failSession("会话启动超时：未能完成 RTC 连接或收到 Bridge 就绪确认，请稍后重试。");
+    }
+  }, milliseconds);
 }
 
 function appendFinal(text, metrics) {
@@ -697,10 +758,11 @@ function clearObservations() {
 // Agora RTC & Audio Capture
 // ==========================================================================
 
-async function joinAgora(config) {
+async function joinAgora(config, attempt) {
   if (!window.AgoraRTC) throw new Error("Agora Web SDK 加载失败");
   window.AgoraRTC.setLogLevel(2);
   const client = window.AgoraRTC.createClient({ mode: "live", codec: "vp8" });
+  runtime.rtcClient = client;
 
   client.on("network-quality", (quality) => {
     runtime.networkQuality = quality;
@@ -722,16 +784,25 @@ async function joinAgora(config) {
     ANS: true,
     AGC: true,
   });
+  if (runtime.startAttempt !== attempt) {
+    microphone.close();
+    await client.leave().catch(() => {});
+    return;
+  }
+  runtime.microphone = microphone;
 
   await client.publish([microphone]);
-  runtime.rtcClient = client;
-  runtime.microphone = microphone;
+  if (runtime.startAttempt !== attempt) {
+    microphone.close();
+    await client.leave().catch(() => {});
+    return;
+  }
   setDot(ui.agoraDot, "on");
   startMeter();
   log("已加入 Agora RTC 并发布麦克风音轨", { channel: config.channel, uid: config.uid });
 }
 
-async function joinLivekit(config) {
+async function joinLivekit(config, attempt) {
   if (!window.LivekitClient) throw new Error("LiveKit SDK 加载失败");
   const LivekitClient = window.LivekitClient;
   const room = new LivekitClient.Room();
@@ -752,11 +823,19 @@ async function joinLivekit(config) {
   });
 
   await room.connect(config.url, config.token);
+  if (runtime.startAttempt !== attempt) {
+    await room.disconnect().catch(() => {});
+    return;
+  }
   await room.localParticipant.setMicrophoneEnabled(true, {
     echoCancellation: true,
     noiseSuppression: true,
     autoGainControl: true,
   });
+  if (runtime.startAttempt !== attempt) {
+    await room.disconnect().catch(() => {});
+    return;
+  }
   setDot(ui.agoraDot, "on");
   startMeter();
   log("已加入 LiveKit 房间并发布麦克风", { room: config.room, identity: config.identity });
@@ -783,6 +862,12 @@ function startMeter() {
 // ==========================================================================
 
 async function start() {
+  if (runtime.starting || runtime.session) return;
+  if (runtime.bridgeOnline !== true) {
+    appendFinal("⚠ Bridge 离线或状态未知，请等待服务恢复后重试。");
+    void refreshStatus();
+    return;
+  }
   runtime.accessToken = localStorage.getItem(STORAGE_KEY) || ui.accessKey.value.trim();
   if (runtime.accessProtected && !runtime.accessToken) {
     openTokenModal();
@@ -790,7 +875,12 @@ async function start() {
     return;
   }
 
-  ui.start.disabled = true;
+  const attempt = ++runtime.startAttempt;
+  runtime.starting = true;
+  runtime.bridgeReady = false;
+  runtime.rtcReady = false;
+  setRunning(false);
+  armStartupTimeout(30000, attempt);
   runtime.speech = createSpeechState();
   runtime.manualCommitAt = null;
   runtime.networkQuality = null;
@@ -799,7 +889,12 @@ async function start() {
 
   try {
     const session = await api("/api/v1/sessions", { method: "POST", body: "{}" });
+    if (runtime.startAttempt !== attempt) {
+      await api(`/api/v1/sessions/${session.sessionId}`, { method: "DELETE" }).catch(() => {});
+      return;
+    }
     runtime.session = session;
+    armStartupTimeout((session.sessionStartTimeoutSeconds || 30) * 1000 + 2000, attempt);
     ui.sessionId.textContent = session.sessionId.slice(0, 8);
     ui.sessionId.title = session.sessionId;
 
@@ -809,13 +904,16 @@ async function start() {
       setDot(ui.agoraDot, "on");
       log("MOCK 模式：跳过浏览器麦克风与 Agora 入会");
     } else if (session.livekit) {
-      await joinLivekit(session.livekit);
+      await joinLivekit(session.livekit, attempt);
     } else {
-      await joinAgora(session.agora);
+      await joinAgora(session.agora, attempt);
     }
 
-    setRunning(true);
+    if (runtime.startAttempt !== attempt) return;
+    runtime.rtcReady = true;
+    if (runtime.bridgeReady) markReady();
   } catch (error) {
+    if (runtime.startAttempt !== attempt) return;
     log("启动会话失败", { error: error.message });
     appendFinal(`⚠ 启动失败: ${error.message}`);
     setSessionState("启动失败");
@@ -830,8 +928,7 @@ async function start() {
       appendFinal("⚠ 已保存的访问密钥无效，请重新配置。");
       openTokenModal();
     }
-    if (runtime.session) await stop();
-    else setRunning(false);
+    await stop("启动失败");
   }
 }
 
@@ -899,8 +996,9 @@ async function speak() {
   }
 }
 
-async function stop() {
+async function stop(label = "待机") {
   const session = runtime.session;
+  await cleanupLocal(label);
   if (session) {
     try {
       await api(`/api/v1/sessions/${session.sessionId}`, { method: "DELETE" });
@@ -908,18 +1006,23 @@ async function stop() {
       log("结束会话失败", { error: error.message });
     }
   }
-  await cleanupLocal();
 }
 
-async function cleanupLocal() {
+async function cleanupLocal(label = "待机") {
+  ++runtime.startAttempt;
+  clearTimeout(runtime.startupTimer);
+  runtime.startupTimer = null;
+  runtime.starting = false;
+  runtime.bridgeReady = false;
+  runtime.rtcReady = false;
   clearInterval(runtime.meterTimer);
   runtime.meterTimer = null;
   runtime.microphone?.stop();
   runtime.microphone?.close();
-  if (runtime.rtcClient) await runtime.rtcClient.leave().catch(() => {});
-  if (runtime.room) await runtime.room.disconnect().catch(() => {});
+  const rtcClient = runtime.rtcClient;
+  const room = runtime.room;
   runtime.remoteAudioElement?.remove();
-  runtime.socket?.close();
+  const socket = runtime.socket;
   runtime.session = null;
   runtime.socket = null;
   runtime.rtcClient = null;
@@ -936,11 +1039,15 @@ async function cleanupLocal() {
   ui.levelBars.forEach((bar) => { bar.style.height = "4px"; });
   ui.partial.textContent = "";
   ui.sessionId.textContent = "—";
-  setSessionState("待机");
+  setSessionState(label);
+  setDot(ui.browserDot, "");
   setDot(ui.agoraDot, "");
   setDot(ui.asrDot, "");
   setRunning(false);
-  refreshStatus();
+  socket?.close();
+  void refreshStatus();
+  if (rtcClient) await rtcClient.leave().catch(() => {});
+  if (room) await room.disconnect().catch(() => {});
 }
 
 // ==========================================================================
@@ -957,7 +1064,7 @@ ui.ttsText.addEventListener("keydown", (event) => {
     speak();
   }
 });
-ui.stop.addEventListener("click", stop);
+ui.stop.addEventListener("click", () => stop());
 ui.exportMetrics.addEventListener("click", exportObservations);
 ui.clearMetrics.addEventListener("click", clearObservations);
 
@@ -1000,6 +1107,7 @@ window.addEventListener("pagehide", () => {
 
 // Initial boot
 handleHashChange();
+setRunning(false);
 refreshStatus();
 renderObservability();
 setInterval(refreshStatus, 5000);

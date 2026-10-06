@@ -8,7 +8,7 @@ use std::{
     net::{TcpStream, ToSocketAddrs},
     path::PathBuf,
     sync::{Arc, OnceLock},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -57,6 +57,8 @@ struct Config {
     bridge_shared_secret: String,
     session_ttl_seconds: u64,
     session_capacity: usize,
+    bridge_heartbeat_timeout_seconds: u64,
+    session_start_timeout_seconds: u64,
     demo_mode: bool,
 }
 
@@ -75,9 +77,7 @@ impl Config {
             rtc_provider: env_or("RTC_PROVIDER", "agora"),
             agora_app_id: env::var("AGORA_APP_ID").unwrap_or_default(),
             agora_app_certificate: env::var("AGORA_APP_CERTIFICATE").unwrap_or_default(),
-            livekit_url: env_or("LIVEKIT_URL", "")
-                .trim_end_matches('/')
-                .to_owned(),
+            livekit_url: env_or("LIVEKIT_URL", "").trim_end_matches('/').to_owned(),
             livekit_api_key: env::var("LIVEKIT_API_KEY").unwrap_or_default(),
             livekit_api_secret: env::var("LIVEKIT_API_SECRET").unwrap_or_default(),
             channel_prefix: env_or("RTC_CHANNEL_PREFIX", "asr"),
@@ -90,6 +90,8 @@ impl Config {
             bridge_shared_secret: env::var("BRIDGE_SHARED_SECRET").unwrap_or_default(),
             session_ttl_seconds: env_u64("SESSION_TTL_SECONDS", 900)?,
             session_capacity: env_u32("SESSION_CAPACITY", 1)? as usize,
+            bridge_heartbeat_timeout_seconds: env_u64("BRIDGE_HEARTBEAT_TIMEOUT_SECONDS", 15)?,
+            session_start_timeout_seconds: env_u64("SESSION_START_TIMEOUT_SECONDS", 30)?,
             demo_mode,
         };
         config.validate()?;
@@ -105,6 +107,16 @@ impl Config {
         }
         if self.session_capacity == 0 || self.session_capacity > 1_000 {
             return Err("SESSION_CAPACITY must be between 1 and 1000".into());
+        }
+        if !(1..=300).contains(&self.bridge_heartbeat_timeout_seconds) {
+            return Err("BRIDGE_HEARTBEAT_TIMEOUT_SECONDS must be between 1 and 300".into());
+        }
+        if self.session_start_timeout_seconds == 0
+            || self.session_start_timeout_seconds > self.session_ttl_seconds
+        {
+            return Err(
+                "SESSION_START_TIMEOUT_SECONDS must be between 1 and SESSION_TTL_SECONDS".into(),
+            );
         }
         if !(10..=300).contains(&self.browser_grant_ttl_seconds) {
             return Err("BROWSER_GRANT_TTL_SECONDS must be between 10 and 300".into());
@@ -233,6 +245,7 @@ struct Session {
     ticket: String,
     state: String,
     expires_at_ms: u64,
+    started_at: Instant,
     owner_subject: Option<String>,
     owner_profile_id: Option<String>,
 }
@@ -255,12 +268,62 @@ struct SocketLink {
     tx: mpsc::UnboundedSender<Message>,
 }
 
+struct BridgeLink {
+    id: Uuid,
+    tx: mpsc::UnboundedSender<Message>,
+    last_pong_at: Instant,
+}
+
 #[derive(Default)]
 struct Inner {
     sessions: HashMap<String, Session>,
     browser_grants: HashMap<String, BrowserGrant>,
-    bridge: Option<SocketLink>,
+    bridge: Option<BridgeLink>,
     clients: HashMap<String, SocketLink>,
+}
+
+impl Inner {
+    fn bridge_online(&self, now: Instant, timeout: Duration) -> bool {
+        self.bridge.as_ref().is_some_and(|bridge| {
+            !bridge.tx.is_closed() && now.duration_since(bridge.last_pong_at) < timeout
+        })
+    }
+}
+
+fn bridge_timeout(config: &Config) -> Duration {
+    Duration::from_secs(config.bridge_heartbeat_timeout_seconds)
+}
+
+fn disconnect_bridge(inner: &mut Inner, socket_id: Uuid, message: &str) {
+    // A previous connection must never clear its replacement's state.
+    if inner
+        .bridge
+        .as_ref()
+        .is_none_or(|bridge| bridge.id != socket_id)
+    {
+        return;
+    }
+    inner.bridge = None;
+    for session in inner
+        .sessions
+        .values_mut()
+        .filter(|session| session.state != "closed")
+    {
+        session.state = "closed".into();
+        if let Some(client) = inner.clients.remove(&session.id) {
+            send_json(
+                &client.tx,
+                &json!({
+                    "type": "asr.error", "sessionId": session.id,
+                    "code": "bridge_offline", "message": message,
+                }),
+            );
+            send_json(
+                &client.tx,
+                &json!({ "type": "session.closed", "sessionId": session.id }),
+            );
+        }
+    }
 }
 
 struct AppState {
@@ -582,7 +645,7 @@ async fn healthz(res: &mut Response) {
 #[handler]
 async fn readyz(res: &mut Response) {
     let inner = state().inner.lock().await;
-    if inner.bridge.is_some() {
+    if inner.bridge_online(Instant::now(), bridge_timeout(&state().config)) {
         res.render(Text::Plain("ready"));
     } else {
         render_error(
@@ -605,7 +668,8 @@ async fn status(res: &mut Response) {
         .count();
     res.render(Json(json!({
         "service": "agora-ominix-control-plane",
-        "bridgeOnline": inner.bridge.is_some(),
+        "bridgeOnline": inner.bridge_online(Instant::now(), bridge_timeout(&app.config)),
+        "sessionStartTimeoutSeconds": app.config.session_start_timeout_seconds,
         "demoMode": app.config.demo_mode,
         "rtcProvider": app.config.rtc_provider,
         "accessProtected": !app.config.client_access_token.is_empty(),
@@ -632,7 +696,7 @@ async fn create_session(req: &mut Request, res: &mut Response) {
     }
     let mut inner = app.inner.lock().await;
 
-    if inner.bridge.is_none() {
+    if !inner.bridge_online(Instant::now(), bridge_timeout(&app.config)) {
         render_error(
             res,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -813,6 +877,7 @@ async fn create_session(req: &mut Request, res: &mut Response) {
         ticket: Uuid::new_v4().to_string(),
         state: "starting".into(),
         expires_at_ms: now + app.config.session_ttl_seconds * 1000,
+        started_at: Instant::now(),
         owner_subject: owner.as_ref().map(|grant| grant.subject.clone()),
         owner_profile_id: owner.as_ref().map(|grant| grant.profile_id.clone()),
     };
@@ -831,7 +896,9 @@ async fn create_session(req: &mut Request, res: &mut Response) {
         .as_ref()
         .is_some_and(|bridge| send_json(&bridge.tx, &start_event));
     if !bridge_sent {
-        inner.bridge = None;
+        if let Some(bridge_id) = inner.bridge.as_ref().map(|bridge| bridge.id) {
+            disconnect_bridge(&mut inner, bridge_id, "内网 Bridge 连接中断");
+        }
         render_error(
             res,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -848,6 +915,7 @@ async fn create_session(req: &mut Request, res: &mut Response) {
         "eventsWsPath": format!("/ws/client/{}", session.id),
         "demoMode": app.config.demo_mode,
         "rtcProvider": app.config.rtc_provider,
+        "sessionStartTimeoutSeconds": app.config.session_start_timeout_seconds,
     });
     if let (Some(response_object), Some(cred_object)) =
         (response.as_object_mut(), client_cred.as_object())
@@ -896,9 +964,7 @@ struct SpeakRequest {
 }
 
 fn valid_speak_text(value: &str) -> bool {
-    !value.is_empty()
-        && value.chars().count() <= 500
-        && !value.chars().any(char::is_control)
+    !value.is_empty() && value.chars().count() <= 500 && !value.chars().any(char::is_control)
 }
 
 fn valid_tts_voice(value: &str) -> bool {
@@ -957,7 +1023,10 @@ async fn speak_text(req: &mut Request, res: &mut Response) {
         .voice
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
-    if voice.as_deref().is_some_and(|value| !valid_tts_voice(value)) {
+    if voice
+        .as_deref()
+        .is_some_and(|value| !valid_tts_voice(value))
+    {
         render_error(
             res,
             StatusCode::BAD_REQUEST,
@@ -980,7 +1049,10 @@ async fn speak_text(req: &mut Request, res: &mut Response) {
         .instruct
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
-    if instruct.as_deref().is_some_and(|value| !valid_tts_instruct(value)) {
+    if instruct
+        .as_deref()
+        .is_some_and(|value| !valid_tts_instruct(value))
+    {
         render_error(
             res,
             StatusCode::BAD_REQUEST,
@@ -1014,10 +1086,11 @@ async fn speak_text(req: &mut Request, res: &mut Response) {
     if let Some(instruct) = instruct {
         event["instruct"] = json!(instruct);
     }
-    let sent = inner
-        .bridge
-        .as_ref()
-        .is_some_and(|bridge| send_json(&bridge.tx, &event));
+    let sent = inner.bridge_online(Instant::now(), bridge_timeout(&app.config))
+        && inner
+            .bridge
+            .as_ref()
+            .is_some_and(|bridge| send_json(&bridge.tx, &event));
     if !sent {
         render_error(
             res,
@@ -1094,9 +1167,10 @@ async fn forward_session_command(req: &mut Request, res: &mut Response, event_ty
         );
         return;
     }
-    let sent = inner.bridge.as_ref().is_some_and(|bridge| {
-        send_json(&bridge.tx, &json!({ "type": event_type, "sessionId": id }))
-    });
+    let sent = inner.bridge_online(Instant::now(), bridge_timeout(&app.config))
+        && inner.bridge.as_ref().is_some_and(|bridge| {
+            send_json(&bridge.tx, &json!({ "type": event_type, "sessionId": id }))
+        });
     if !sent {
         render_error(
             res,
@@ -1148,29 +1222,57 @@ async fn bridge_ws(req: &mut Request, res: &mut Response) {
 async fn bridge_socket(mut socket: WebSocket, app: Arc<AppState>) {
     let socket_id = Uuid::new_v4();
     let (tx, mut rx) = mpsc::unbounded_channel();
+    let timeout = bridge_timeout(&app.config);
+    let mut last_pong_at = Instant::now();
+    let mut pending_ping: Option<Vec<u8>> = None;
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(5).min(timeout / 3));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     {
         let mut inner = app.inner.lock().await;
-        if inner
-            .bridge
-            .replace(SocketLink { id: socket_id, tx })
-            .is_some()
-        {
+        if let Some(previous_id) = inner.bridge.as_ref().map(|bridge| bridge.id) {
+            disconnect_bridge(
+                &mut inner,
+                previous_id,
+                "内网 Bridge 已重新连接，请重新开始会话",
+            );
             warn!("replaced an existing bridge connection");
         }
+        inner.bridge = Some(BridgeLink {
+            id: socket_id,
+            tx,
+            last_pong_at,
+        });
     }
     info!(bridge_connection = %socket_id, "bridge connected");
 
     loop {
+        let deadline = tokio::time::Instant::from_std(last_pong_at + timeout);
         tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                warn!(bridge_connection = %socket_id, "bridge heartbeat timed out");
+                break;
+            }
             outbound = rx.recv() => {
                 let Some(message) = outbound else { break; };
-                if socket.send(message).await.is_err() { break; }
+                if !matches!(tokio::time::timeout_at(deadline, socket.send(message)).await, Ok(Ok(()))) {
+                    break;
+                }
             }
             inbound = socket.recv() => {
                 match inbound {
+                    Some(Ok(message)) if message.is_pong() => {
+                        if pending_ping.as_deref() == Some(message.as_bytes()) {
+                            pending_ping = None;
+                            last_pong_at = Instant::now();
+                            let mut inner = app.inner.lock().await;
+                            if let Some(bridge) = inner.bridge.as_mut().filter(|bridge| bridge.id == socket_id) {
+                                bridge.last_pong_at = last_pong_at;
+                            }
+                        }
+                    }
                     Some(Ok(message)) if message.is_text() => {
                         if let Ok(text) = message.as_str() {
-                            handle_bridge_event(&app, text).await;
+                            handle_bridge_event(&app, socket_id, text).await;
                         }
                     }
                     Some(Ok(message)) if message.is_close() => break,
@@ -1182,46 +1284,24 @@ async fn bridge_socket(mut socket: WebSocket, app: Arc<AppState>) {
                     }
                 }
             }
-        }
-    }
-
-    let mut inner = app.inner.lock().await;
-    let disconnected_current = inner
-        .bridge
-        .as_ref()
-        .is_some_and(|link| link.id == socket_id);
-    if disconnected_current {
-        inner.bridge = None;
-        let active_ids: Vec<String> = inner
-            .sessions
-            .values_mut()
-            .filter(|session| session.state != "closed")
-            .map(|session| {
-                session.state = "closed".into();
-                session.id.clone()
-            })
-            .collect();
-        for session_id in active_ids {
-            if let Some(client) = inner.clients.remove(&session_id) {
-                send_json(
-                    &client.tx,
-                    &json!({
-                        "type": "asr.error",
-                        "sessionId": session_id,
-                        "message": "内网 Bridge 连接中断",
-                    }),
-                );
-                send_json(
-                    &client.tx,
-                    &json!({ "type": "session.closed", "sessionId": session_id }),
-                );
+            _ = heartbeat.tick() => {
+                let payload = pending_ping.get_or_insert_with(|| Uuid::new_v4().as_bytes().to_vec());
+                if !matches!(tokio::time::timeout_at(deadline, socket.send(Message::ping(payload.clone()))).await, Ok(Ok(()))) {
+                    break;
+                }
             }
         }
     }
+
+    disconnect_bridge(
+        &mut *app.inner.lock().await,
+        socket_id,
+        "内网 Bridge 连接中断或心跳超时",
+    );
     info!(bridge_connection = %socket_id, "bridge disconnected");
 }
 
-async fn handle_bridge_event(app: &Arc<AppState>, text: &str) {
+async fn handle_bridge_event(app: &Arc<AppState>, socket_id: Uuid, text: &str) {
     let relay_started = Instant::now();
     let bridge_event_received_at_ms = unix_ms();
     let mut event: Value = match serde_json::from_str(text) {
@@ -1244,7 +1324,18 @@ async fn handle_bridge_event(app: &Arc<AppState>, text: &str) {
         return;
     };
     let mut inner = app.inner.lock().await;
-    let Some(session) = inner.sessions.get_mut(&session_id) else {
+    if inner
+        .bridge
+        .as_ref()
+        .is_none_or(|bridge| bridge.id != socket_id)
+    {
+        return;
+    }
+    let Some(session) = inner
+        .sessions
+        .get_mut(&session_id)
+        .filter(|session| session.state != "closed")
+    else {
         warn!(session_id, event_type, "ignored event for unknown session");
         return;
     };
@@ -1356,7 +1447,7 @@ async fn client_socket(mut socket: WebSocket, app: Arc<AppState>, session_id: St
                 "type": "session.snapshot",
                 "sessionId": session_id,
                 "state": state_value,
-                "bridgeOnline": inner.bridge.is_some(),
+                "bridgeOnline": inner.bridge_online(Instant::now(), bridge_timeout(&app.config)),
             }),
         );
         inner
@@ -1460,11 +1551,21 @@ async fn client_socket(mut socket: WebSocket, app: Arc<AppState>, session_id: St
 }
 
 async fn session_reaper(app: Arc<AppState>) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
     loop {
         interval.tick().await;
         let now = unix_ms();
         let mut inner = app.inner.lock().await;
+        if !inner.bridge_online(Instant::now(), bridge_timeout(&app.config))
+            && let Some(bridge_id) = inner.bridge.as_ref().map(|bridge| bridge.id)
+        {
+            disconnect_bridge(&mut inner, bridge_id, "内网 Bridge 连接中断或心跳超时");
+        }
+        expire_starting_sessions(
+            &mut inner,
+            Instant::now(),
+            Duration::from_secs(app.config.session_start_timeout_seconds),
+        );
         let expired_ids: Vec<String> = inner
             .sessions
             .values_mut()
@@ -1495,6 +1596,33 @@ async fn session_reaper(app: Arc<AppState>) {
         inner
             .browser_grants
             .retain(|_, grant| grant.expires_at_ms > now);
+    }
+}
+
+fn expire_starting_sessions(inner: &mut Inner, now: Instant, timeout: Duration) {
+    for session in inner.sessions.values_mut().filter(|session| {
+        session.state == "starting" && now.duration_since(session.started_at) >= timeout
+    }) {
+        session.state = "closed".into();
+        if let Some(bridge) = &inner.bridge {
+            send_json(
+                &bridge.tx,
+                &json!({"type": "session.stop", "sessionId": session.id}),
+            );
+        }
+        if let Some(client) = inner.clients.remove(&session.id) {
+            send_json(
+                &client.tx,
+                &json!({
+                    "type": "asr.error", "sessionId": session.id,
+                    "code": "session_start_timeout", "message": "Bridge 未在限定时间内准备好会话，请稍后重试",
+                }),
+            );
+            send_json(
+                &client.tx,
+                &json!({"type": "session.closed", "sessionId": session.id}),
+            );
+        }
     }
 }
 
@@ -1615,8 +1743,163 @@ mod tests {
             bridge_shared_secret: "0123456789abcdef".into(),
             session_ttl_seconds: 900,
             session_capacity: 1,
+            bridge_heartbeat_timeout_seconds: 15,
+            session_start_timeout_seconds: 30,
             demo_mode: true,
         }
+    }
+
+    fn test_session(id: &str, state: &str, started_at: Instant) -> Session {
+        Session {
+            id: id.into(),
+            ticket: "ticket".into(),
+            state: state.into(),
+            expires_at_ms: unix_ms() + 60_000,
+            started_at,
+            owner_subject: None,
+            owner_profile_id: None,
+        }
+    }
+
+    #[test]
+    fn bridge_online_requires_fresh_heartbeat_and_open_sender() {
+        let now = Instant::now();
+        let timeout = Duration::from_secs(15);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut inner = Inner::default();
+        assert!(!inner.bridge_online(now, timeout));
+        inner.bridge = Some(BridgeLink {
+            id: Uuid::new_v4(),
+            tx,
+            last_pong_at: now,
+        });
+        assert!(inner.bridge_online(now + Duration::from_secs(14), timeout));
+        assert!(!inner.bridge_online(now + timeout, timeout));
+        drop(rx);
+        assert!(!inner.bridge_online(now, timeout));
+    }
+
+    #[test]
+    fn stale_connection_cleanup_cannot_disconnect_replacement() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let id = Uuid::new_v4();
+        let mut inner = Inner::default();
+        inner.bridge = Some(BridgeLink {
+            id,
+            tx,
+            last_pong_at: Instant::now(),
+        });
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "ready", Instant::now()));
+        disconnect_bridge(&mut inner, Uuid::new_v4(), "old connection");
+        assert_eq!(inner.bridge.as_ref().unwrap().id, id);
+        assert_eq!(inner.sessions["s1"].state, "ready");
+    }
+
+    #[test]
+    fn bridge_disconnect_closes_sessions_and_notifies_clients() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (client_tx, mut client_rx) = mpsc::unbounded_channel();
+        let id = Uuid::new_v4();
+        let mut inner = Inner::default();
+        inner.bridge = Some(BridgeLink {
+            id,
+            tx,
+            last_pong_at: Instant::now(),
+        });
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "starting", Instant::now()));
+        inner
+            .sessions
+            .insert("s2".into(), test_session("s2", "ready", Instant::now()));
+        inner.clients.insert(
+            "s1".into(),
+            SocketLink {
+                id: Uuid::new_v4(),
+                tx: client_tx,
+            },
+        );
+        disconnect_bridge(&mut inner, id, "offline");
+        assert!(inner.bridge.is_none());
+        assert!(
+            inner
+                .sessions
+                .values()
+                .all(|session| session.state == "closed")
+        );
+        assert!(inner.clients.is_empty());
+        let error: Value =
+            serde_json::from_str(client_rx.try_recv().unwrap().as_str().unwrap()).unwrap();
+        assert_eq!(error["code"], "bridge_offline");
+        let closed: Value =
+            serde_json::from_str(client_rx.try_recv().unwrap().as_str().unwrap()).unwrap();
+        assert_eq!(closed["type"], "session.closed");
+    }
+
+    #[tokio::test]
+    async fn startup_timeout_releases_capacity_and_late_ready_cannot_revive_session() {
+        let started = Instant::now();
+        let app = Arc::new(AppState::new(base_config()));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (client_tx, mut client_rx) = mpsc::unbounded_channel();
+        let id = Uuid::new_v4();
+        {
+            let mut inner = app.inner.lock().await;
+            inner.bridge = Some(BridgeLink {
+                id,
+                tx,
+                last_pong_at: started,
+            });
+            inner
+                .sessions
+                .insert("s1".into(), test_session("s1", "starting", started));
+            inner
+                .sessions
+                .insert("s2".into(), test_session("s2", "ready", started));
+            inner.clients.insert(
+                "s1".into(),
+                SocketLink {
+                    id: Uuid::new_v4(),
+                    tx: client_tx,
+                },
+            );
+            expire_starting_sessions(
+                &mut inner,
+                started + Duration::from_secs(29),
+                Duration::from_secs(30),
+            );
+            assert_eq!(inner.sessions["s1"].state, "starting");
+            expire_starting_sessions(
+                &mut inner,
+                started + Duration::from_secs(30),
+                Duration::from_secs(30),
+            );
+            assert_eq!(inner.sessions["s1"].state, "closed");
+            assert_eq!(inner.sessions["s2"].state, "ready");
+        }
+        let stop: Value = serde_json::from_str(rx.try_recv().unwrap().as_str().unwrap()).unwrap();
+        assert_eq!(stop["type"], "session.stop");
+        let error: Value =
+            serde_json::from_str(client_rx.try_recv().unwrap().as_str().unwrap()).unwrap();
+        assert_eq!(error["code"], "session_start_timeout");
+        handle_bridge_event(&app, id, r#"{"type":"session.ready","sessionId":"s1"}"#).await;
+        assert_eq!(app.inner.lock().await.sessions["s1"].state, "closed");
+    }
+
+    #[test]
+    fn heartbeat_and_startup_timeouts_are_bounded() {
+        let mut config = base_config();
+        config.bridge_heartbeat_timeout_seconds = 0;
+        assert!(config.validate().is_err());
+        config.bridge_heartbeat_timeout_seconds = 301;
+        assert!(config.validate().is_err());
+        config.bridge_heartbeat_timeout_seconds = 15;
+        config.session_start_timeout_seconds = 0;
+        assert!(config.validate().is_err());
+        config.session_start_timeout_seconds = config.session_ttl_seconds + 1;
+        assert!(config.validate().is_err());
     }
 
     #[test]

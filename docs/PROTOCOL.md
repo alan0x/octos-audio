@@ -93,6 +93,19 @@ Wall-clock timestamps are diagnostic only and MUST NOT be subtracted across host
 
 ## Lifecycle and current capacity
 
+- Bridge connectivity is verified with control-plane WebSocket Ping/Pong, at
+  most every 5 seconds. A missing matching Pong for
+  `BRIDGE_HEARTBEAT_TIMEOUT_SECONDS` (default 15 seconds) marks the Bridge offline,
+  rejects new sessions, and closes existing sessions. Silent network failures
+  may take up to this timeout to appear offline. This verifies the RTC Bridge
+  connection, not the health of the separate ASR/TTS inference services.
+- Sessions must receive `session.ready` within `SESSION_START_TIMEOUT_SECONDS`
+  (default 30 seconds), or they are stopped and their capacity is released.
+  Connected clients receive `asr.error` with code `session_start_timeout`, followed
+  by `session.closed`. Bridge disconnection errors use code `bridge_offline`.
+- The initial `session.snapshot` includes the current session state, so clients
+  must also accept a `ready` snapshot when readiness preceded their subscription.
+  The browser enables recognition controls once both RTC and Bridge are ready.
 - Concurrency is bounded by `SESSION_CAPACITY` on the control plane and by `BRIDGE_MAX_SESSIONS` / the OminiX instance pool on the bridge host.
 - Sessions live in memory and expire automatically; a restart requires a new session.
 - Bridge or browser event-socket disconnect releases the affected sessions.
