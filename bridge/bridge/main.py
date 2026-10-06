@@ -92,6 +92,8 @@ class RealSession:
                 top_p=float(os.getenv("TTS_TOP_P", "0.8")),
                 seed=int(os.getenv("TTS_SEED", "42")) if os.getenv("TTS_SEED", "42").strip() else None,
                 avoid_comma_split=os.getenv("TTS_AVOID_COMMA_SPLIT", "true").lower() not in ("0", "false", "no"),
+                max_chunk_chars=int(os.getenv("TTS_MAX_CHUNK_CHARS", "40")),
+                max_attempts=int(os.getenv("TTS_MAX_ATTEMPTS", "3")),
             )
             if tts_url
             else None
