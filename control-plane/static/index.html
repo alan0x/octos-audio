@@ -97,7 +97,7 @@
             <div class="stat-card">
               <div class="stat-value">Qwen3 模型</div>
               <div class="stat-label">100% 私有化算力</div>
-              <div class="stat-desc">Qwen3-ASR + Qwen3-TTS 定制多音色低随机度生成</div>
+              <div class="stat-desc">Qwen3-ASR + Qwen3-TTS 预设音色与语气控制</div>
             </div>
           </div>
         </div>
@@ -187,7 +187,7 @@
                 <tr>
                   <td><span class="method-badge post">POST</span></td>
                   <td><code>/api/v1/sessions/{id}/speak</code></td>
-                  <td>在频道内实时朗读文字（TTS），支持指定音色、语速与情感 Prompt</td>
+                  <td>在频道内实时朗读文字（TTS），支持选择预设音色、语速与情感 Prompt</td>
                   <td><span class="auth-tag">Bearer / Cookie</span></td>
                 </tr>
                 <tr>
@@ -503,6 +503,7 @@ await room.localParticipant.setMicrophoneEnabled(true, {
               <div class="doc-eyebrow">API REFERENCE</div>
               <h2 class="doc-subtitle">语音合成播报 · POST /api/v1/sessions/{id}/speak</h2>
               <p>在指定的活跃会话中触发 TTS 合成。音频直接推入 RTC 频道，用户无需轮询下载音频文件。</p>
+              <p>当前支持预设音色选择、语速调整和语气提示词，尚未接入音色创建、参考录音上传或声音克隆。</p>
 
               <h3 class="param-title">请求体字段规范 (JSON)</h3>
               <div class="table-container">
@@ -526,7 +527,7 @@ await room.localParticipant.setMicrophoneEnabled(true, {
                       <td><code>voice</code></td>
                       <td>string</td>
                       <td>否</td>
-                      <td>音色标识。默认 <code>serena</code>。中文可选 <code>vivian</code>, <code>uncle_fu</code>, <code>dylan</code>, <code>eric</code> 或自定义音色名(英文音色为 <code>ryan</code>, <code>aiden</code>)。</td>
+                      <td>预设音色标识。省略时使用 Bridge 配置的默认音色（默认 <code>serena</code>）。中文预设包括 <code>serena</code>, <code>vivian</code>, <code>uncle_fu</code>, <code>dylan</code>, <code>eric</code>；英文预设包括 <code>ryan</code>, <code>aiden</code>。可用音色取决于 Bridge 加载的 TTS 模型，填写新名字不会创建音色。</td>
                     </tr>
                     <tr>
                       <td><code>speed</code></td>
@@ -538,7 +539,7 @@ await room.localParticipant.setMicrophoneEnabled(true, {
                       <td><code>instruct</code></td>
                       <td>string</td>
                       <td>否</td>
-                      <td>语气或情感提示词，最多 200 字。如 <code>"温柔亲切地"</code>、<code>"非常严肃地"</code>。</td>
+                      <td>调整预设音色的语气或情感，最多 200 字。如 <code>"温柔亲切地"</code>、<code>"非常严肃地"</code>。此参数不会创建新音色。</td>
                     </tr>
                   </tbody>
                 </table>
@@ -739,22 +740,16 @@ await room.localParticipant.setMicrophoneEnabled(true, {
               <!-- Voice & Speed Parameters -->
               <div class="tts-params-row">
                 <div class="form-group flex-1">
-                  <label for="ttsVoiceSelect">音色选择 (Voice)</label>
+                  <label for="ttsVoiceSelect">预设音色 (Voice)</label>
                   <select id="ttsVoiceSelect" class="form-select" disabled>
                     <option value="serena" selected>serena(温暖知性女声 · 中文 · 推荐)</option>
                     <option value="vivian">vivian(活泼俏皮女声 · 中文)</option>
                     <option value="uncle_fu">uncle_fu(低沉磁性男声 · 中文)</option>
                     <option value="dylan">dylan(京腔青年男声)</option>
                     <option value="eric">eric(川腔活力男声)</option>
-                    <option value="custom">自定义音色...</option>
+                    <option value="ryan">ryan(英文预设音色)</option>
+                    <option value="aiden">aiden(英文预设音色)</option>
                   </select>
-                  <input
-                    type="text"
-                    id="ttsVoiceCustom"
-                    class="form-input mt-2 hidden"
-                    placeholder="输入自定义音色 ID"
-                    maxlength="64"
-                  />
                 </div>
 
                 <div class="form-group flex-1">

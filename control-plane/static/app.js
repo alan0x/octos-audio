@@ -40,7 +40,6 @@ const ui = {
   // TTS Section
   ttsText: document.querySelector("#ttsText"),
   ttsVoiceSelect: document.querySelector("#ttsVoiceSelect"),
-  ttsVoiceCustom: document.querySelector("#ttsVoiceCustom"),
   ttsSpeed: document.querySelector("#ttsSpeed"),
   speedValueLabel: document.querySelector("#speedValueLabel"),
   ttsInstruct: document.querySelector("#ttsInstruct"),
@@ -210,12 +209,6 @@ document.querySelectorAll(".copy-btn").forEach((btn) => {
 // TTS Parameter Helpers (Playground)
 // ==========================================================================
 
-ui.ttsVoiceSelect.addEventListener("change", () => {
-  const isCustom = ui.ttsVoiceSelect.value === "custom";
-  ui.ttsVoiceCustom.classList.toggle("hidden", !isCustom);
-  if (isCustom) ui.ttsVoiceCustom.focus();
-});
-
 ui.ttsSpeed.addEventListener("input", () => {
   ui.speedValueLabel.textContent = `${Number(ui.ttsSpeed.value).toFixed(1)}x`;
 });
@@ -265,9 +258,6 @@ function setRunning(running) {
   ui.ttsSpeed.disabled = !running;
   ui.ttsInstruct.disabled = !running;
   ui.speak.disabled = !running;
-  if (ui.ttsVoiceSelect.value === "custom") {
-    ui.ttsVoiceCustom.disabled = !running;
-  }
 }
 
 function createSpeechState() {
@@ -964,10 +954,7 @@ async function speak() {
   const text = ui.ttsText.value.trim();
   if (!runtime.session || !text) return;
 
-  let voice = ui.ttsVoiceSelect.value;
-  if (voice === "custom") {
-    voice = ui.ttsVoiceCustom.value.trim();
-  }
+  const voice = ui.ttsVoiceSelect.value;
 
   const speed = parseFloat(ui.ttsSpeed.value) || 1.0;
   const instruct = ui.ttsInstruct.value.trim();

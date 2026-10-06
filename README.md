@@ -54,8 +54,8 @@ Browser (Web SDK) <──text/events WSS── Control plane (Rust + Salvo)
 - **Concurrent sessions**: `SESSION_CAPACITY` admission control + round-robin
   ASR instance pool; 90+ concurrent sessions measured on a single M-series host.
 - **Two-way TTS**: text is pushed through the control plane, synthesized on the
-  Bridge and published into the RTC room; voice/speed/instruct parameters and
-  barge-in are supported.
+  Bridge and published into the RTC room; preset voice/speed/instruct parameters and
+  barge-in are supported. Voice creation and cloning are not exposed by this project.
 - **Latency observability**: per-utterance waterfall (network, endpointing,
   inference, relay, render), P50/P95 statistics, JSON export.
 - **Mock mode**: develop the control plane and frontend without any RTC

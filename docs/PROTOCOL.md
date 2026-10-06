@@ -12,7 +12,7 @@ Audio never flows through the VPS.
   one-time browser grant. Requires `Authorization: Bearer <OCTOS_SERVICE_TOKEN>`.
 - `POST /api/v1/sessions`: allocate a session, up to `SESSION_CAPACITY` concurrent sessions.
 - `POST /api/v1/sessions/{id}/commit`: force an utterance boundary.
-- `POST /api/v1/sessions/{id}/speak`: synthesize `{"text":"...","voice":"optional"}` with Qwen3-TTS and play it into the session's RTC channel.
+- `POST /api/v1/sessions/{id}/speak`: synthesize `{"text":"...","voice":"serena"}` with Qwen3-TTS and play it into the session's RTC channel. The optional `voice` selects an existing model preset; omitting it uses the Bridge's `TTS_VOICE` setting (default `serena`). Available presets depend on the loaded TTS model. This API does not create voices, accept reference recordings, or perform voice cloning; `instruct` controls expression within the selected preset.
 - `DELETE /api/v1/sessions/{id}`: stop the session.
 - `GET /ws/client/{id}`: browser text-event WebSocket, authenticated by a path-scoped HttpOnly cookie.
 
