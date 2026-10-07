@@ -103,6 +103,9 @@ def _split_after(text: str, breaks: str) -> List[str]:
 
 def _finish_chunk(chunk: str) -> str:
     chunk = chunk.strip()
+    # A chunk cut at a clause boundary ends with "," so the model keeps a
+    # continuing intonation instead of a sentence-final fall.
+    continues = chunk[-1:] in _CLAUSE_BREAKS
     # Inner clause marks become half-width without trailing space so OminiX
     # does not re-split the chunk into micro-fragments.
     chunk = re.sub(r"[，、]", ",", chunk)
@@ -110,7 +113,9 @@ def _finish_chunk(chunk: str) -> str:
     chunk = chunk.rstrip(",;；:：")
     if not chunk:
         return ""
-    if chunk[-1] not in "。！？…!?.":
+    if continues:
+        chunk += ","
+    elif chunk[-1] not in "。！？…!?.":
         chunk += "。"
     return chunk.translate(_CJK_TERMINATORS)
 

@@ -56,13 +56,13 @@ class SplitTtsChunksTest(unittest.TestCase):
         self.assertEqual(
             split_tts_chunks(LONG_TEXT),
             [
-                "欢迎来到云朵科学馆,当你沿着大厅左侧的蓝色指示线缓步前行。",
-                "经过展示声音如何穿过空气的互动装置,再走过一座长约 3.5 米。",
-                "会随着脚步亮起柔和灯光的小桥之后。",
+                "欢迎来到云朵科学馆,当你沿着大厅左侧的蓝色指示线缓步前行,",
+                "经过展示声音如何穿过空气的互动装置,再走过一座长约 3.5 米,",
+                "会随着脚步亮起柔和灯光的小桥之后,",
                 "就能在二楼体验区听到由 TTS 系统生成的中文与 English 混合播报。",
-                "为了让每一位参观者都能听清说明,我们将背景音乐的音量降低了 百分之20。",
+                "为了让每一位参观者都能听清说明,我们将背景音乐的音量降低了 百分之20,",
                 "并在介绍数字,单位和操作步骤时保留适当的停顿,同时提醒你。",
-                "先按下绿色按钮,等待三秒,再轻轻转动右侧旋钮,观察屏幕上的波形是否随声音变化。",
+                "先按下绿色按钮,等待三秒,再轻轻转动右侧旋钮,观察屏幕上的波形是否随声音变化,",
                 "如果一切准备就绪,你愿意和我们一起,用耳朵发现那些平时容易被忽略的细节吗？",
                 "让我们开始今天的声音探索吧！",
             ],
@@ -77,6 +77,10 @@ class SplitTtsChunksTest(unittest.TestCase):
         spoken = lambda text: [c for c in text if "一" <= c <= "鿿"]
         self.assertEqual(spoken("".join(chunks)), spoken(LONG_TEXT.replace("%", "百分之")))
 
+    def test_clause_cut_keeps_continuing_intonation(self):
+        for chunk, pause in plan_tts_chunks(LONG_TEXT):
+            self.assertEqual(chunk.endswith(","), pause == 150, chunk)
+
     def test_inner_clause_marks_do_not_trigger_server_splitting(self):
         for chunk in split_tts_chunks(LONG_TEXT):
             inner = chunk[:-1]
@@ -86,14 +90,14 @@ class SplitTtsChunksTest(unittest.TestCase):
     def test_dash_becomes_clause_break(self):
         self.assertEqual(
             split_tts_chunks("观察波形——如果准备就绪，就开始吧。", max_chars=6),
-            ["观察波形。", "如果准备就绪。", "就开始吧。"],
+            ["观察波形,", "如果准备就绪,", "就开始吧。"],
         )
 
     def test_percent_is_spelled_out(self):
         self.assertEqual(split_tts_chunks("音量降低了20%和3.5％。"), ["音量降低了百分之20和百分之3.5。"])
 
     def test_digit_grouping_comma_is_not_a_break(self):
-        self.assertEqual(split_tts_chunks("共有1,000人，请排队。", max_chars=4), ["共有1,000人。", "请排队。"])
+        self.assertEqual(split_tts_chunks("共有1,000人，请排队。", max_chars=4), ["共有1,000人,", "请排队。"])
 
     def test_lines_and_sentences_are_boundaries(self):
         self.assertEqual(
@@ -111,7 +115,7 @@ class SplitTtsChunksTest(unittest.TestCase):
             [
                 ("第一句话。", 400),
                 ("注意。", 300),
-                ("先按下按钮。", 150),
+                ("先按下按钮,", 150),
                 ("再等待三秒钟后转动旋钮。", 400),
             ],
         )
