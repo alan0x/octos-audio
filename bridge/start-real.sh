@@ -10,7 +10,7 @@ if [[ ! -f .env ]]; then
 fi
 
 if [[ ! -x .venv/bin/python ]]; then
-  echo "Missing bridge/.venv. Recreate it with the Python 3.13 command in README.md." >&2
+  echo "Missing bridge/.venv. Create it as described in docs/DEPLOY_MACOS.md." >&2
   exit 1
 fi
 

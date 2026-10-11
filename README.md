@@ -48,6 +48,7 @@ Browser (Web SDK) <──text/events WSS── Control plane (Rust + Salvo)
 | `bridge/` | Python: RTC receive/publish (Agora Server SDK or livekit-rtc), endpointing, ASR pool routing, TTS synthesis & playout, load-test tools |
 | `deploy/` | Docker Compose, environment templates, Nginx reverse-proxy example |
 | `docs/PROTOCOL.md` | Control-plane protocol: REST, WebSocket events, metrics conventions |
+| `docs/DEPLOY_MACOS.md` | Deploying the macOS inference host (OminiX + Bridge) |
 
 ## Features
 
@@ -77,6 +78,9 @@ and an RTC layer: a self-hosted [LiveKit](https://github.com/livekit/livekit)
 SFU or an Agora project. Configure `deploy/.env.example` and
 `bridge/.env.example`, then start the control plane and the bridge
 (`bridge/start-real.sh`).
+
+Step-by-step setup of the macOS inference host (OminiX build, models, single
+or pooled instances, cutover): [`docs/DEPLOY_MACOS.md`](docs/DEPLOY_MACOS.md).
 
 ## Checks
 
