@@ -24,15 +24,16 @@ jobs:
       - name: Python adapter tests
         working-directory: bridge
         run: |
-          pip install httpx==0.28.1
+          pip install httpx==0.28.1 websockets==15.0.1
           python -m unittest discover -s tests -v
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
-      - name: Browser JavaScript syntax
+      - name: Browser JavaScript and shell checks
         run: |
           node --check control-plane/static/app.js
+          node --test control-plane/tests/app.test.cjs
           bash -n bridge/start-real.sh
           bash -n bridge/start-ominix-asr.sh
-          bash -n deploy/macos/install-launch-agents.sh
-          bash -n deploy/macos/status.sh
+          bash -n bridge/start-ominix-pool.sh
+          bash -n bridge/start-ominix-tts.sh
